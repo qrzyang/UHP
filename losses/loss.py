@@ -12,7 +12,7 @@ from .kitti_utils import *
 from .layers import *
 import argparse
 
-import cv2, scipy
+import scipy
 from .torchinterp1d import interp1d
 
 
@@ -42,18 +42,19 @@ class Loss(nn.Module):
         self.get_conf_loss = cluster_loss(self.opt)
 
 
-        if not self.opt.no_ssim:
-            self.ssim = SSIM()
-            self.ssim.to(self.device)
 
-        self.backproject_depth = {}
+        self.ssim = SSIM()
+        self.ssim.to(self.device)
+
+
+        self.backproject_PL_Loss = {}
         self.project_3d = {}
-        for scale in self.opt.scales:
+        for scale in [0]:
             h = self.opt.height // (2 ** scale)
             w = self.opt.width // (2 ** scale)
 
-            self.backproject_depth[scale] = BackprojectDepth(self.opt.batch_size, h, w)
-            self.backproject_depth[scale].to(self.device)
+            self.backproject_PL_Loss[scale] = Backproject_PL_Loss(self.opt.batch_size, h, w)
+            self.backproject_PL_Loss[scale].to(self.device)
 
             self.project_3d[scale] = Project3D(self.opt.batch_size, h, w)
             self.project_3d[scale].to(self.device)
@@ -105,17 +106,20 @@ class Loss(nn.Module):
             inputs[key] = ipt.to(self.opt.device)
         scale_list = [k[1] for k in outputs.keys() if k.__contains__('disp')]
         for scale in scale_list:
-            disp = outputs[("disp", scale)]
+            shift_pixels = inputs['shift_pixels']
+            disp = outputs[("disp", scale)][..., :-shift_pixels]
             source_scale = 0
 
+            outputs[("disp", scale)]=disp
             for i, frame_id in enumerate(self.opt.frame_ids[1:]):
 
-                disp_limited = torch.zeros_like(disp)
-                disp_limited = torch.where(disp<0, torch.tensor(0.).to(self.device), disp)
-                disp_limited = torch.where(disp>self.opt.maxdisp, torch.tensor(self.opt.maxdisp, dtype=torch.float).to(self.device), disp_limited)
-                outputs[("color", frame_id, scale)] = self.warp(
+                shift_disp = F.pad(disp, (shift_pixels,0, 0, 0))
+                warp_right = self.warp(
                     inputs[("color", frame_id, source_scale)],
-                    disp_limited)
+                    shift_disp)
+                outputs[("color", frame_id, scale)] = warp_right[..., shift_pixels:]
+                outputs["warped"] = outputs[("color", frame_id, scale)].clone().detach()
+
 
 
     def compute_reprojection_loss(self, pred, target):
@@ -130,8 +134,23 @@ class Loss(nn.Module):
             ssim_loss = self.ssim(pred, target).mean(1, True)
             reprojection_loss = 0.85 * ssim_loss + 0.15 * l1_loss
 
+        
         return reprojection_loss
+    
+    def compute_reprojection_loss_Tmp(self, pred, target, outputs):     # TODO:DE
+        abs_diff = torch.abs(target - pred)
+        l1_loss = abs_diff.mean(1, True)
 
+        reprojection_loss = l1_loss
+        ssim_loss = self.ssim(pred, target).mean(1, True)
+            
+        outputs["ssim_loss"],  outputs["l1_loss"] = ssim_loss, l1_loss
+        return
+
+    def compute_rep_crop_loss(self, pred, target):
+        abs_diff = torch.abs(target - pred)
+        # l1_loss = abs_diff.mean(1, True)
+        ssim_loss = self.ssim(pred, target).mean(1, True)
 
 
     def compute_losses(self, inputs, outputs):
@@ -163,7 +182,8 @@ class Loss(nn.Module):
             for frame_id in self.opt.frame_ids[1:]:
                 pred = outputs[("color", frame_id, scale)]
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
-
+                self.compute_reprojection_loss_Tmp(pred, target, outputs)               # TODO:DE
+                
                 diff = torch.abs(pred - target).mean(1) # diff use the mean of color diff
                 diff = diff.unsqueeze(1)
                 prop_diff_pyramid.append(diff)
@@ -173,14 +193,103 @@ class Loss(nn.Module):
 
             reprojection_loss, _ = torch.min(reprojection_losses, dim=1, keepdim=True)
 
+            if scale>7 and global_loss_weights[4]==1:
+                with torch.no_grad():
+                    def get_left_edge(disp):
+                        B, C, H, W = disp.size()
+                        # mesh grid
+                        xx = torch.arange(0, W, device=disp.device).view(1, -1).repeat(H, 1)
+                        xx = xx.view(1, 1, H, W).repeat(B, 1, 1, 1)
+                        xx = xx - disp + inputs["shift_pixels"]
+                        edge_bool = xx<=1
+                        tmp_edge_bool = edge_bool
+                        if torch.any(edge_bool):
+                            for i in range((int)(xx[edge_bool].max())):
+                                tmp_edge_bool = F.pad(tmp_edge_bool[...,1:], (0, 1, 0, 0), mode='constant', value=0)
+                                edge_bool = tmp_edge_bool | edge_bool
+                        return edge_bool
+                        
+                    # occlusion 
+                    grad_x = disp[:, :, :, 1:] - disp[:, :, :, :-1]
+                    grad_x = F.pad(grad_x, (1, 0, 0, 0), mode='constant', value=0)
+                    grad_flag = grad_x>0.5    # TODO: constant value
+                    disp_marked = torch.where(grad_flag, disp.clone(), torch.zeros_like(disp))
+                    occ_tensor = torch.zeros_like(disp)
+                    disp_marked1 = disp_marked.clone()
+                    for occ_i in range((int)(torch.max(disp_marked))):
+                        tmp = (disp_marked>0).to(torch.float)
+                        occ_tensor += tmp
+                        disp_marked = F.pad(disp_marked[...,1:], (0, 1, 0, 0), mode='constant', value=0)
+                        disp_marked -= 1.01
+                    occ_tensor = (occ_tensor>0).to(torch.float)
+                        
+                    # grad_flag = grad_x<-1    # TODO: constant value
+                    # disp_marked = torch.where(grad_flag, disp.clone(), torch.zeros_like(disp))
+                    # for occ_i in range((int)(torch.max(disp_marked))):
+                    #     disp_marked = F.pad(disp_marked[...,1:], (0, 1, 0, 0), mode='constant', value=0)
+                    #     disp_marked -= 5
+                    #     tmp = (disp_marked>0).to(torch.float)
+                    #     occ_tensor -= tmp
+                    # occ_tensor = (occ_tensor>0).to(torch.float)
+                        
+                    # find left pixel of occ
+                    tmp_occ_bool = (occ_tensor>0).to(torch.float)
+                    left_pixel_bool = (tmp_occ_bool-F.pad(tmp_occ_bool[...,1:], (0, 1, 0, 0)))==-1
+                    disp_left_pixel = torch.where(left_pixel_bool, disp.clone(), torch.zeros_like(disp)) 
+                    
+                    occ_tensor = tmp_occ_bool
+                    for occ_i in range((int)(torch.max(disp_left_pixel))):
+                        disp_left_pixel = F.pad(disp_left_pixel[...,:-1], (1, 0, 0, 0))
+                        disp_left_pixel -= 1.4
+                        tmp = (disp_left_pixel>0).to(torch.float)
+                        occ_tensor -= tmp
+                    # for occ_i in range(np.random.randint(10, max((int)(torch.max(disp_marked1)),11))):
+                    #     disp_marked1 = F.pad(disp_marked1[...,:-1], (1, 0, 0, 0), mode='constant', value=0)
+                    #     disp_marked1 -= 1.01
+                    #     tmp = (disp_marked1>0).to(torch.float)
+                    #     occ_tensor += tmp
+                                 
+                    left_edge = get_left_edge(disp) #TODO: check the grad
+                    occ_tensor = torch.where((occ_tensor>0) | (left_edge), torch.zeros_like(occ_tensor), torch.ones_like(occ_tensor))
+                    # occ_tensor[occ_tensor>0] = 0.
+                    # occ_tensor[occ_tensor<=0] = 1
+                    occ_tensor = occ_tensor.detach()
+                    
+                    # if True:
+                    #     occ_array = []
+                    #     disp_occ_tmp = disp.clone()
+                    #     for occ_i in range(min((int)(torch.max(disp)), 80)):
+                    #         disp_occ_tmp = F.pad(disp_occ_tmp[...,1:], (0, 1, 0, 0), mode='constant', value=0)
+                    #         disp_occ_tmp -= 1
+                    #         occ_array += [disp_occ_tmp]
+                    #     occ_tensor = torch.cat(occ_array, 1)
+                    #     occ_tensor,_ = torch.max(occ_tensor,dim=1,keepdim=True)
+                    #     occ = occ_tensor - disp
+                    #     disp_ref_tmp = occ + 2
+                    #     disp_ref_tmp[occ<-0.9] = 0
+                    #     disp_ref = self.warp(disp, disp_ref_tmp, padding_mode='reflection')
+                    #     # disp_ref = torch.where(occ>=0, disp_ref_tmp, disp)
+                    #     disp_ref.detach_()
+                # outputs['occ'] = (occ>=0).to(torch.float)
+                # if True:
+                #     outputs['occ'] = torch.abs(disp - disp_ref)
+                #     occ_ref_loss = torch.abs(disp - disp_ref)
+                #     occ_ref_loss = occ_ref_loss.mean()* warp_loss_weights[scale] * global_loss_weights[2] #TODO: loss_weight
+                #     losses[f"occ_ref_loss{scale}"] = occ_ref_loss
+                #     outputs[f'occ_ref_{scale}'] = disp_ref
+                reprojection_loss *= occ_tensor   # TODO:occ
+                outputs['occ'] = (occ_tensor==0.).to(torch.float)
+                # outputs[f'reprojection_loss_tensor_{scale}'] = reprojection_loss
 
-            outputs['reprojection_loss_tensor'] = reprojection_loss
-            reprojection_loss *= ignore_mask
-            reproj_loss_top = torch.topk(reprojection_loss.view(-1), (int)(reprojection_loss.numel()/20))[0].min()
-            reproj_loss_high = (reprojection_loss>reproj_loss_top)
-            reprojection_loss*=((~reproj_loss_high).to(torch.float)+0.01)
+            
 
-            reprojection_loss = reprojection_loss.sum() / ((ignore_mask).sum() + 1e-6)
+            reprojection_loss = reprojection_loss.mean()
+            # reprojection_loss *= ignore_mask
+            # reproj_loss_top = torch.topk(reprojection_loss.view(-1), (int)(reprojection_loss.numel()/20))[0].min()
+            # reproj_loss_high = (reprojection_loss>reproj_loss_top)
+            # reprojection_loss*=((~reproj_loss_high).to(torch.float)+0.01)
+
+            # reprojection_loss = reprojection_loss.sum() / ((ignore_mask).sum() + 1e-6)
 
             losses['reproj_loss/{}'.format(scale)] = reprojection_loss*warp_loss_weights[scale] * global_loss_weights[2]
 
@@ -190,12 +299,21 @@ class Loss(nn.Module):
             mean_disp = disp.mean(2, True).mean(3, True)
             norm_disp = disp / (mean_disp + 1e-7)
             
+            # if scale > 10:
+            #     smooth_loss = get_smooth_loss(norm_disp, color, ignore_mask) * warp_loss_weights[scale] * global_loss_weights[0] * 1e-2
+            #     loss += smooth_loss
+            #     losses[f"loss_smooth{scale}"] = smooth_loss
+                
             # 3D Planar Segmentation Loss
             Pl_loss = 0
             if scale > 10:            
-                # smooth_loss = get_smooth_loss(norm_disp, color, ignore_mask)
-                Pl_loss = get_Pl_loss(norm_disp, inputs["edge"])
-                losses[f"Pl_loss{scale}"] = Pl_loss * warp_loss_weights[scale] * global_loss_weights[3]
+                # _, _, outputs["depth"] = self.Pl_loss(disp, inputs["edge"])
+                # Pl_loss, outputs["Pl_loss"], outputs["depth"] = self.Pl_loss(disp, inputs["edge"])
+                # Pl_loss, outputs["grad2_map"],outputs["Pl_loss"] = get_Pl_loss1(disp, inputs["edge"])
+                # # Pl_loss = get_Pl_loss(disp, inputs["edge"]) + 0.001 * smooth_loss
+                # outputs["Pl_loss"] = get_grad_disp(disp, inputs["edge"])
+                outputs["points"], outputs["grad2_map"], Pl_loss, outputs["depth"], outputs["Pl_loss"] = self.backproject_PL_Loss[0](disp,inputs[("inv_K", 0)], inputs["edge"])
+                losses[f"loss_PL{scale}"] = Pl_loss * warp_loss_weights[scale] * global_loss_weights[3]
 
             loss += Pl_loss * warp_loss_weights[scale] * global_loss_weights[3]
 
@@ -225,7 +343,7 @@ class Loss(nn.Module):
             else:
                 j = i-1
             w_loss_pyramid.append(
-                w_loss_weights[i] * self.w_loss(w, w_pyramid[j], prop_diff_pyramid[i+1], prop_diff_pyramid[j+1], 
+                w_loss_weights[i] * self.w_loss(w, w_pyramid[j], prop_diff_pyramid[i+1].detach(), prop_diff_pyramid[j+1].detach(), 
                                                 ignore_mask==1,False, 1, 5)  # index for prop_diff_pyramid plus 1 since there is no confidence at 1st level
             )
         w_loss_vec = torch.cat(w_loss_pyramid, dim=0)
@@ -273,7 +391,7 @@ class Loss(nn.Module):
         for i, metric in enumerate(self.depth_metric_names):
             losses[metric] = np.array(depth_errors[i].cpu())
 
-    def warp(self, x, disp):
+    def warp(self, x, disp, padding_mode='border'):
         """
         warp an image/tensor (im2) back to im1, according to the optical flow
         x: [B, C, H, W] (im2)
@@ -287,15 +405,20 @@ class Loss(nn.Module):
         yy = yy.view(1, 1, H, W).repeat(B, 1, 1, 1)
         vgrid = torch.cat((xx, yy), 1).float()
 
-        # vgrid = Variable(grid)
-        vgrid[:,:1,:,:] = vgrid[:,:1,:,:] - disp
+        if padding_mode == 'reflection':
+            tmp = vgrid[:,:1,:,:] - disp
+            tmp[tmp<0] = vgrid[:,:1,:,:][tmp<0] * (-1) - disp[tmp<0]
+            vgrid[:,:1,:,:] = tmp
+        else:
+            # vgrid = Variable(grid)
+            vgrid[:,:1,:,:] = vgrid[:,:1,:,:] - disp
 
         # scale grid to [-1,1]
         vgrid[:, 0, :, :] = 2.0 * vgrid[:, 0, :, :].clone() / max(W - 1, 1) - 1.0
         vgrid[:, 1, :, :] = 2.0 * vgrid[:, 1, :, :].clone() / max(H - 1, 1) - 1.0
 
         vgrid = vgrid.permute(0, 2, 3, 1)
-        output = F.grid_sample(x, vgrid, padding_mode='border')
+        output = F.grid_sample(x, vgrid, padding_mode=padding_mode)
         return output
 
     def w_loss(self, conf, conf2, diff, diff2, mask, high_conf_mask = False, C1=1, C2=1.5):
@@ -307,6 +430,8 @@ class Loss(nn.Module):
         :param C2:
         :return: torch.Tensor: loss
         """
+        conf = F.pad(conf, (0,diff.shape[-1]-conf.shape[-1],0,0))
+        conf2 = F.pad(conf2, (0,diff.shape[-1]-conf2.shape[-1],0,0))
         closer_mask = (diff < C1) | high_conf_mask
         further_mask = diff > C2
         mask = mask * (closer_mask + further_mask)  # mask and
@@ -333,7 +458,7 @@ class Loss(nn.Module):
             opt.frame_ids = [0]
             opt.use_stereo = True
 
-            opt.no_ssim = False
+            opt.no_ssim = False  # TODO: check
             opt.device = self.args.device
             opt.loss_weights = self.args.loss_weights
 
@@ -353,23 +478,24 @@ class cluster_loss(nn.Module):
             self.conv1.weight.data = kernel
             self.pool1 = nn.MaxPool2d(5, 1, padding=2).to(self.device)
             self.opt = opt
-            self.canny = CannyFilter(device=self.device)
+            self.canny = CannyDetector(device=self.device)
             self.canny.to(self.opt.device)
 
     def forward(self, inputs, outputs):   
         # conf_loss
         conf_loss = 0.
-        conf = outputs["conf"]
+        conf = outputs["conf"][...,:-inputs["shift_pixels"]]
 
         with torch.no_grad():
             # get edge image from Canny or edge map
             
             # image_canny = self.canny(gray)[5]+0.
-            image_canny = (inputs["edge"]<0.5).to(torch.float)
+            # image_canny = (inputs["edge"]<0.5).to(torch.float)
+            image_canny = inputs["edge"]
             outputs["img_canny"] = image_canny
 
         # image_canny *= disp_grad_high.to(torch.float)
-        nonzero_count = torch.torch.count_nonzero(image_canny)
+        nonzero_count = torch.count_nonzero(image_canny)
         conf_weight_tmp = ((torch.numel(image_canny)-nonzero_count) / (nonzero_count+1e-6))
         conf_entropy_loss = -conf_weight_tmp * image_canny * torch.log(conf+1e-6) - (1-image_canny) * torch.log(1-conf+1e-6)
         

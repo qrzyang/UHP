@@ -7,6 +7,7 @@ from datasets.data_io import get_transform, read_all_lines, pfm_imread, get_tran
 import torchvision.transforms.functional as photometric
 import pdb
 import torch
+import torch.nn.functional as F
 # import cv2
 
 class KITTIDataset(Dataset):
@@ -35,6 +36,10 @@ class KITTIDataset(Dataset):
         elif len(splits[0]) == 3:
             disp_images = [x[2] for x in splits]
             return left_images, right_images, disp_images, None
+        elif len(splits[0]) == 4 and splits[0][2] == 'None':
+
+            edge_images = [x[3] for x in splits]
+            return left_images, right_images, None, edge_images
         else:
             disp_images = [x[2] for x in splits]
             edge_images = [x[3] for x in splits]
@@ -96,12 +101,6 @@ class KITTIDataset(Dataset):
         else:
             edge = None
 
-        if self.dx_gt_filenames and self.dy_gt_filenames:  # has disparity slant param ground truth
-            dx_gt = self.load_dx_dy(os.path.join(self.datapath, self.dx_gt_filenames[index]))
-            dy_gt = self.load_dx_dy(os.path.join(self.datapath, self.dy_gt_filenames[index]))
-        else:
-            dx_gt = None
-            dy_gt = None
 
         if self.training:
             w, h = left_img.size
@@ -152,6 +151,7 @@ class KITTIDataset(Dataset):
             inputs["left"] = left_img
             inputs["right"] = right_img
             if disparity is not None:
+                disparity = torch.from_numpy(disparity)
                 inputs["disparity"] = disparity
             if edge is not None:
                 inputs["edge"] = edge
@@ -170,23 +170,17 @@ class KITTIDataset(Dataset):
             right_pad = 1280 - w
             assert top_pad > 0 and right_pad > 0
             # pad images
-            left_img = np.lib.pad(left_img, ((0, 0), (top_pad, 0), (0, right_pad)), mode='constant', constant_values=0)
-            right_img = np.lib.pad(right_img, ((0, 0), (top_pad, 0), (0, right_pad)), mode='constant',
-                                   constant_values=0)
+            left_img = np.lib.pad(left_img, ((0, 0), (top_pad, 0), (0, right_pad)), mode='edge')
+            right_img = np.lib.pad(right_img, ((0, 0), (top_pad, 0), (0, right_pad)), mode='edge')
             # pad disparity gt
             if disparity is not None:
                 assert len(disparity.shape) == 2
                 disparity = np.lib.pad(disparity, ((top_pad, 0), (0, right_pad)), mode='constant', constant_values=0)
 
-            # pad dx and dy gt
-            if dx_gt is not None and dy_gt is not None:
-                assert len(dx_gt.shape) == 2
-                dx_gt = np.lib.pad(dx_gt, ((top_pad, 0), (0, right_pad)), mode='constant', constant_values=0)
-                assert len(dy_gt.shape) == 2
-                dy_gt = np.lib.pad(dy_gt, ((top_pad, 0), (0, right_pad)), mode='constant', constant_values=0)
 
             # if disparity is not None and dx_gt is not None and dy_gt is not None:
             if disparity is not None:
+                disparity = torch.from_numpy(disparity)
                 return {"left": left_img,
                         "right": right_img,
                         "disparity": disparity,
@@ -246,3 +240,48 @@ class KITTI_Raw(KITTIDataset):
 
         return os.path.isfile(velo_filename)
     
+
+from torch.utils.data.dataloader import default_collate
+class MyCollator(object):
+    def __init__(self, **params):
+        self.params = params
+        
+    def shift(self, sample):
+        shift_pixels = np.random.randint(1, 200)
+        sample[("color", 0, 0)] = sample[("color", 0, 0)][...,shift_pixels:]
+        sample[("color", 's', 0)] = sample[("color", 's', 0)]
+        sample["left"] = F.pad(sample["left"][...,shift_pixels:],(0, shift_pixels,0, 0))
+        sample["right"] = F.pad(sample["right"][...,shift_pixels:],(0, shift_pixels,0, 0))
+        if "disparity" in sample.keys():
+            sample["disparity"] = F.pad(sample["disparity"][...,shift_pixels:],(0, shift_pixels,0, 0))
+        if "edge" in sample.keys():
+            sample["edge"] = sample["edge"][...,shift_pixels:]
+        sample["shift_pixels"] = torch.as_tensor(shift_pixels)
+        
+    def crop(self, sample):
+        
+        _,_, h, w = sample["left"].size()
+        crop_w, crop_h = 1152, 320  # similar to crops of HITNet paper, but multiple of 320*960
+
+        x1 = random.randint(0, w - crop_w)
+        y1 = random.randint(0, h - crop_h)
+
+        # record crop 
+        sample["top_pad"] = torch.as_tensor(y1)
+        sample["left_pad"] = torch.as_tensor(x1)
+        
+        sample[("color", 0, 0)] = sample[("color", 0, 0)][...,y1:y1+crop_h,:, x1:x1 + crop_w]
+        sample[("color", 's', 0)] = sample[("color", 's', 0)][...,y1:y1+crop_h,:, x1:x1 + crop_w]
+        sample["left"] = sample["left"][...,y1:y1+crop_h,:, x1:x1 + crop_w]
+        sample["right"] = sample["right"][...,y1:y1+crop_h,:, x1:x1 + crop_w]
+        if "edge" in sample.keys():
+            sample["edge"] = sample["edge"][...,y1:y1+crop_h,:, x1:x1 + crop_w]
+        if "disparity" in sample.keys():
+            sample["disparity"] = sample["disparity"][..., y1:y1 + crop_h, x1:x1 + crop_w]
+        
+        
+    def __call__(self, data):
+        sample = default_collate(data)
+        self.shift(sample)
+        # self.crop(sample)
+        return sample

@@ -7,18 +7,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd.functional import hessian
 
-def disp_to_depth(disp, min_depth, max_depth):
+def disp_to_depth(disp, min_depth = 1, max_depth = 100):
     """Convert network's sigmoid output into depth prediction
     The formula for this conversion is given in the 'additional considerations'
     section of the paper.
     """
-    disp = disp/256.0
+    disp = disp/192.0
     min_disp = 1 / max_depth
     max_disp = 1 / min_depth
     scaled_disp = min_disp + (max_disp - min_disp) * disp
     depth = 1 / scaled_disp
     return scaled_disp, depth
-
+def disp_to_depth_real(disp):
+    focallength = 720.
+    baseline = 0.54
+    
+    disp_cut = torch.clamp(disp,min=0.1)
+    depth = focallength*baseline/disp_cut
+    return depth
 
 def transformation_from_parameters(axisangle, translation, invert=False):
     """Convert the network's (axisangle, translation) output into a 4x4 matrix
@@ -131,11 +137,11 @@ class Conv3x3(nn.Module):
         return out
 
 
-class BackprojectDepth(nn.Module):
+class Backproject_PL_Loss(nn.Module):
     """Layer to transform a depth image into a point cloud
     """
     def __init__(self, batch_size, height, width):
-        super(BackprojectDepth, self).__init__()
+        super(Backproject_PL_Loss, self).__init__()
 
         self.batch_size = batch_size
         self.height = height
@@ -154,13 +160,51 @@ class BackprojectDepth(nn.Module):
         self.pix_coords = self.pix_coords.repeat(batch_size, 1, 1)
         self.pix_coords = nn.Parameter(torch.cat([self.pix_coords, self.ones], 1),
                                        requires_grad=False)
+        
+    def cal_grad(self, points):
+        points = F.pad(points, (1,1,1,1),'constant',0)
+        # x - direction
+        dis_x = torch.sqrt((points[:, 0, :, 1:] - points[:, 0, :, :-1]).pow(2) + (points[:, 1, :, 1:] - points[:, 1, :, :-1]).pow(2) + 1e-6) # distance
+        dis_x.detach_()
+        dz_x = (points[:, 2, :, 1:] - points[:, 2, :, :-1]) / dis_x
+        dz_x2 = (dz_x[..., 1:] - dz_x[..., :-1]) / dis_x[..., :-1]
+        
+        # y - direction
+        dis_y = torch.sqrt((points[:, 0, 1:, :] - points[:, 0, :-1, :]).pow(2) + (points[:, 1, 1:, :] - points[:, 1, :-1, :]).pow(2) + 1e-6)  # distance
+        dis_y.detach_()
+        dz_y = (points[:, 2, 1:, :] - points[:, 2, :-1, :]) / dis_y     
+        dz_y2 = (dz_y[..., 1:, :] - dz_y[..., :-1, :]) / dis_y[..., :-1, :]
+        
+        dz_xy = (dz_x[..., 1:, :] - dz_x[..., :-1, :]) / dis_y[..., :, :-1]
 
-    def forward(self, depth, inv_K):
+        dz_yx = (dz_y[..., 1:] - dz_y[..., :-1]) / dis_x[..., :-1, :]
+        
+        grad_2order = torch.abs(dz_x2)[..., 1:-1,:] + 0.5*torch.abs(dz_y2)[..., 1:-1] + torch.abs(dz_xy)[...,:-1,:-1] + torch.abs(dz_yx)[...,:-1,:-1]
+        return grad_2order.unsqueeze(1)
+
+    def forward(self, disp, inv_K, edge, **pad):
+        # _, depth = disp_to_depth(disp.clone())
+        depth = disp_to_depth_real(disp.clone())
+        _,_,h,w = disp.size()
+            
+        shift_tmp = self.width-depth.shape[-1]
+        depth = F.pad(depth, (shift_tmp,0,0,0),'replicate')
         cam_points = torch.matmul(inv_K[:, :3, :3], self.pix_coords)
         cam_points = depth.view(self.batch_size, 1, -1) * cam_points
         cam_points = torch.cat([cam_points, self.ones], 1)
+        
+        cam_points = cam_points.view(self.batch_size,-1,depth.shape[-2],depth.shape[-1])
 
-        return cam_points
+        cam_points = cam_points[...,shift_tmp:]
+        grad_2order = self.cal_grad(cam_points) * 1e-2
+        grad_2order = torch.tanh(grad_2order)   
+        
+        edge_cut = torch.where(edge<0.5, torch.zeros_like(edge), edge)
+        edge_log = (-torch.log((1-edge_cut) + 1e-8))
+        edge_log = F.pad(edge_log[..., 1:-1, 1:-1], (1,1,1,1),'constant',0)
+        Pl_loss = grad_2order * edge_log
+        
+        return cam_points, grad_2order.clone(), Pl_loss.mean(), depth, Pl_loss.clone()
 
 
 class Project3D(nn.Module):
@@ -237,6 +281,53 @@ def get_Pl_loss(disp, edge):
     grad_disp *= -torch.log((1-edge_cut[:,:,:-2,:-2]) + 1e-8)
 
     return grad_disp.mean()
+
+class PL_Loss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        kernel = torch.tensor([[0, 1, 0],
+                    [1, -4, 1],
+                    [0, 1, 0]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.laplacian_conv = nn.Conv2d(1, 1, kernel_size=3, padding=1, padding_mode='replicate',bias=False)
+        self.laplacian_conv.weight.data = kernel
+        
+    def forward(self, disp, edge):
+        _, depth = disp_to_depth(disp)
+
+        grad_depth = self.laplacian_conv(depth)
+        grad_depth = torch.abs(grad_depth)
+        grad_depth = F.pad(grad_depth[..., 1:-1,1:-1],(1, 1, 1, 1),mode='constant',value=0)
+
+        edge_cut = torch.where(edge<0.5, torch.zeros_like(edge), edge)
+        grad_depth_loss = grad_depth * (-torch.log((1-edge_cut[:,:,:,:]) + 1e-8))
+        
+        tmp_grad_graph = grad_depth                                 # TODO:DE
+        tmp_max = torch.max(tmp_grad_graph)
+        tmp_grad_graph = tmp_grad_graph / tmp_max
+        tmp_grad_graph[tmp_grad_graph>0.1] = 0.
+        
+        tmp_depth = depth
+        return grad_depth_loss.mean(), tmp_grad_graph, tmp_depth
+        
+
+def get_Pl_loss1(disp, edge):
+    kernel = torch.tensor([[0, 1, 0],
+                        [1, -4, 1],
+                        [0, 1, 0]], dtype=torch.float32, device=disp.device).view(1, 1, 3, 3)
+
+    # _, depth = disp_to_depth(disp)
+
+    disp_pad = F.pad(disp, (1, 1, 1, 1), mode='constant', value=0)
+    grad_disp = F.conv2d(disp_pad, kernel, padding=0).abs()
+
+    edge_cut = torch.where(edge<0.5, torch.zeros_like(edge), edge)
+    edge_log = (-torch.log((1-edge_cut) + 1e-8) + 1e-6)
+    edge_log = F.pad(edge_log[..., 1:-1, 1:-1], (1,1,1,1),'constant',0)
+    
+    grad_disp_loss = grad_disp * edge_log
+
+    return grad_disp_loss.mean(), grad_disp.clone().detach(), grad_disp_loss.clone().detach()
+
 
 
 class SSIM(nn.Module):

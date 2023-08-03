@@ -7,7 +7,8 @@ import torch, torch.nn as nn, numpy as np
 sys.path.append(os.path.dirname(__file__))
 from torchinterp1d import interp1d
 import cv2
-
+from scipy.signal import gaussian
+import math
 
 
 def readlines(filename):
@@ -142,193 +143,183 @@ def fill_zeros_2d(disp):
     return disp_filled_2d
 
 
-class CannyFilter(nn.Module):
-    def __init__(self,
-                 k_gaussian=3,
-                 mu=0,
-                 sigma=1,
-                 k_sobel=3,
-                 device = 'cpu'):
-        super(CannyFilter, self).__init__()
-        # device
+def get_state_dict(filter_size=5, std=1.0, map_func=lambda x:x):
+    generated_filters = gaussian(filter_size, std=std).reshape([1, filter_size
+                                                   ]).astype(np.float32)
+
+    gaussian_filter_horizontal = generated_filters[None, None, ...]
+
+    gaussian_filter_vertical = generated_filters.T[None, None, ...]
+
+    sobel_filter_horizontal = np.array([[[
+        [1., 0., -1.], 
+        [2., 0., -2.],
+        [1., 0., -1.]]]], 
+        dtype='float32'
+    )
+
+    sobel_filter_vertical = np.array([[[
+        [1., 2., 1.], 
+        [0., 0., 0.], 
+        [-1., -2., -1.]]]], 
+        dtype='float32'
+    )
+
+    directional_filter = np.array(
+        [[[[ 0.,  0.,  0.],
+          [ 0.,  1., -1.],
+          [ 0.,  0.,  0.]]],
+
+
+        [[[ 0.,  0.,  0.],
+          [ 0.,  1.,  0.],
+          [ 0.,  0., -1.]]],
+
+
+        [[[ 0.,  0.,  0.],
+          [ 0.,  1.,  0.],
+          [ 0., -1.,  0.]]],
+
+
+        [[[ 0.,  0.,  0.],
+          [ 0.,  1.,  0.],
+          [-1.,  0.,  0.]]],
+
+
+        [[[ 0.,  0.,  0.],
+          [-1.,  1.,  0.],
+          [ 0.,  0.,  0.]]],
+
+
+        [[[-1.,  0.,  0.],
+          [ 0.,  1.,  0.],
+          [ 0.,  0.,  0.]]],
+
+
+        [[[ 0., -1.,  0.],
+          [ 0.,  1.,  0.],
+          [ 0.,  0.,  0.]]],
+
+
+        [[[ 0.,  0., -1.],
+          [ 0.,  1.,  0.],
+          [ 0.,  0.,  0.]]]], 
+        dtype=np.float32
+    )
+
+    connect_filter = np.array([[[
+        [1., 1., 1.], 
+        [1., 0., 1.], 
+        [1., 1., 1.]]]],
+        dtype=np.float32
+    )
+
+    return {
+        'gaussian_filter_horizontal.weight': map_func(gaussian_filter_horizontal),
+        'gaussian_filter_vertical.weight': map_func(gaussian_filter_vertical),
+        'sobel_filter_horizontal.weight': map_func(sobel_filter_horizontal),
+        'sobel_filter_vertical.weight': map_func(sobel_filter_vertical),
+        'directional_filter.weight': map_func(directional_filter),
+        'connect_filter.weight': map_func(connect_filter)
+    }
+
+
+# https://github.com/jm12138/CannyDetector
+class CannyDetector(nn.Module):
+    def __init__(self, filter_size=5, std=1.0, device='cpu'):
+        super(CannyDetector, self).__init__()
+        # 配置运行设备
         self.device = device
-        
-        # gaussian
-        with torch.no_grad():
-            gaussian_2D = self.get_gaussian_kernel(k_gaussian, mu, sigma)
-            self.gaussian_filter = nn.Conv2d(in_channels=1,
-                                            out_channels=1,
-                                            kernel_size=k_gaussian,
-                                            padding=k_gaussian // 2,
-                                            bias=False)
-            self.gaussian_filter.weight[:] = torch.from_numpy(gaussian_2D)
 
-            # sobel
+        # 高斯滤波器
+        self.gaussian_filter_horizontal = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(1,filter_size), padding=(0,filter_size//2), bias=False)
+        self.gaussian_filter_vertical = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(filter_size,1), padding=(filter_size//2,0), bias=False)
 
-            sobel_2D = self.get_sobel_kernel(k_sobel)
-            self.sobel_filter_x = nn.Conv2d(in_channels=1,
-                                            out_channels=1,
-                                            kernel_size=k_sobel,
-                                            padding=k_sobel // 2,
-                                            bias=False)
-            self.sobel_filter_x.weight[:] = torch.from_numpy(sobel_2D)
+        # Sobel 滤波器
+        self.sobel_filter_horizontal = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, padding=1, bias=False)
+        self.sobel_filter_vertical = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, padding=1, bias=False)
 
+        # 定向滤波器
+        self.directional_filter = nn.Conv2d(in_channels=1, out_channels=8, kernel_size=3, padding=1, bias=False)
 
-            self.sobel_filter_y = nn.Conv2d(in_channels=1,
-                                            out_channels=1,
-                                            kernel_size=k_sobel,
-                                            padding=k_sobel // 2,
-                                            bias=False)
-            self.sobel_filter_y.weight[:] = torch.from_numpy(sobel_2D.T)
+        # 连通滤波器
+        self.connect_filter = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, padding=1, bias=False)
 
+        # 初始化参数
+        params = get_state_dict(filter_size=filter_size, std=std, map_func=lambda x:torch.from_numpy(x).to(self.device))
+        self.load_state_dict(params)
 
-            # thin
+    @torch.no_grad()
+    def forward(self, img, threshold1=2.5, threshold2=5):
+        # 拆分图像通道
+        img_r = img[:,0:1] # red channel
+        img_g = img[:,1:2] # green channel
+        img_b = img[:,2:3] # blue channel
 
-            thin_kernels = self.get_thin_kernels()
-            directional_kernels = np.stack(thin_kernels)
+        # Step1: 应用高斯滤波进行模糊降噪
+        blur_horizontal = self.gaussian_filter_horizontal(img_r)
+        blurred_img_r = self.gaussian_filter_vertical(blur_horizontal)
+        blur_horizontal = self.gaussian_filter_horizontal(img_g)
+        blurred_img_g = self.gaussian_filter_vertical(blur_horizontal)
+        blur_horizontal = self.gaussian_filter_horizontal(img_b)
+        blurred_img_b = self.gaussian_filter_vertical(blur_horizontal)
 
-            self.directional_filter = nn.Conv2d(in_channels=1,
-                                                out_channels=8,
-                                                kernel_size=thin_kernels[0].shape,
-                                                padding=thin_kernels[0].shape[-1] // 2,
-                                                bias=False)
-            self.directional_filter.weight[:, 0] = torch.from_numpy(directional_kernels)
+        # Step2: 用 Sobel 算子求图像的强度梯度
+        grad_x_r = self.sobel_filter_horizontal(blurred_img_r)
+        grad_y_r = self.sobel_filter_vertical(blurred_img_r)
+        grad_x_g = self.sobel_filter_horizontal(blurred_img_g)
+        grad_y_g = self.sobel_filter_vertical(blurred_img_g)
+        grad_x_b = self.sobel_filter_horizontal(blurred_img_b)
+        grad_y_b = self.sobel_filter_vertical(blurred_img_b)
 
-            # hysteresis
+        # Step2: 确定边缘梯度和方向
+        grad_mag = torch.sqrt(grad_x_r**2 + grad_y_r**2)
+        grad_mag += torch.sqrt(grad_x_g**2 + grad_y_g**2)
+        grad_mag += torch.sqrt(grad_x_b**2 + grad_y_b**2)
+        grad_orientation = (torch.atan2(grad_y_r+grad_y_g+grad_y_b, grad_x_r+grad_x_g+grad_x_b) * (180.0/math.pi))
+        grad_orientation += 180.0
+        grad_orientation =  torch.round(grad_orientation / 45.0) * 45.0
 
-            hysteresis = np.ones((3, 3)) + 0.25
-            self.hysteresis = nn.Conv2d(in_channels=1,
-                                        out_channels=1,
-                                        kernel_size=3,
-                                        padding=1,
-                                        bias=False)
-            self.hysteresis.weight[:] = torch.from_numpy(hysteresis)
+        # Step3: 非最大抑制，边缘细化
+        all_filtered = self.directional_filter(grad_mag)
 
+        inidices_positive = (grad_orientation / 45) % 8
+        inidices_negative = ((grad_orientation / 45) + 4) % 8
 
+        batch, _, height, width = inidices_positive.shape
+        pixel_count = height * width * batch
+        pixel_range = torch.Tensor([range(pixel_count)]).to(self.device)
 
-    def get_gaussian_kernel(self, k=3, mu=0, sigma=2, normalize=True):
-        # compute 1 dimension gaussian
-        gaussian_1D = np.linspace(-1, 1, k)
-        # compute a grid distance from center
-        x, y = np.meshgrid(gaussian_1D, gaussian_1D)
-        distance = (x ** 2 + y ** 2) ** 0.5
+        indices = (inidices_positive.reshape((-1, )) * pixel_count + pixel_range).squeeze()
+        channel_select_filtered_positive = all_filtered.reshape((-1, ))[indices.long()].reshape((batch, 1, height, width))
 
-        # compute the 2 dimension gaussian
-        gaussian_2D = np.exp(-(distance - mu) ** 2 / (2 * sigma ** 2))
-        gaussian_2D = gaussian_2D / (2 * np.pi *sigma **2)
+        indices = (inidices_negative.reshape((-1, )) * pixel_count + pixel_range).squeeze()
+        channel_select_filtered_negative = all_filtered.reshape((-1, ))[indices.long()].reshape((batch, 1, height, width))
 
-        # normalize part (mathematically)
-        if normalize:
-            gaussian_2D = gaussian_2D / np.sum(gaussian_2D)
-        return gaussian_2D
+        channel_select_filtered = torch.stack([channel_select_filtered_positive, channel_select_filtered_negative])
 
-    
-    def get_sobel_kernel(self, k=3):
-        # get range
-        range = np.linspace(-(k // 2), k // 2, k)
-        # compute a grid the numerator and the axis-distances
-        x, y = np.meshgrid(range, range)
-        sobel_2D_numerator = x
-        sobel_2D_denominator = (x ** 2 + y ** 2)
-        sobel_2D_denominator[:, k // 2] = 1  # avoid division by zero
-        sobel_2D = sobel_2D_numerator / sobel_2D_denominator
-        return sobel_2D
+        is_max = channel_select_filtered.min(dim=0)[0] > 0.0
 
-    def get_thin_kernels(self, start=0, end=360, step=45):
-            k_thin = 3  # actual size of the directional kernel
-            # increase for a while to avoid interpolation when rotating
-            k_increased = k_thin + 2
+        thin_edges = grad_mag.clone()
+        thin_edges[is_max==0] = 0.0
 
-            # get 0° angle directional kernel
-            thin_kernel_0 = np.zeros((k_increased, k_increased))
-            thin_kernel_0[k_increased // 2, k_increased // 2] = 1
-            thin_kernel_0[k_increased // 2, k_increased // 2 + 1:] = -1
+        # Step4: 双阈值
+        low_threshold = min(threshold1, threshold2)
+        high_threshold = max(threshold1, threshold2)
+        thresholded = thin_edges.clone()
+        lower = thin_edges<low_threshold
+        thresholded[lower] = 0.0
+        higher = thin_edges>high_threshold
+        thresholded[higher] = 1.0
+        connect_map = self.connect_filter(higher.float())
+        middle = torch.logical_and(thin_edges>=low_threshold, thin_edges<=high_threshold)
+        thresholded[middle] = 0.0
+        connect_map[torch.logical_not(middle)] = 0
+        thresholded[connect_map>0] = 1.0
+        thresholded[..., 0, :] = 0.0
+        thresholded[..., -1, :] = 0.0
+        thresholded[..., :, 0] = 0.0
+        thresholded[..., :, -1] = 0.0
+        thresholded = (thresholded>0.0).float()
 
-            # rotate the 0° angle directional kernel to get the other ones
-            thin_kernels = []
-            for angle in range(start, end, step):
-                (h, w) = thin_kernel_0.shape
-                # get the center to not rotate around the (0, 0) coord point
-                center = (w // 2, h // 2)
-                # apply rotation
-                rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1)
-                kernel_angle_increased = cv2.warpAffine(thin_kernel_0, rotation_matrix, (w, h), cv2.INTER_NEAREST)
-
-                # get the k=3 kerne
-                kernel_angle = kernel_angle_increased[1:-1, 1:-1]
-                is_diag = (abs(kernel_angle) == 1)      # because of the interpolation
-                kernel_angle = kernel_angle * is_diag   # because of the interpolation
-                thin_kernels.append(kernel_angle)
-            return thin_kernels
-
-    def forward(self, img, low_threshold=0.05, high_threshold=0.25, hysteresis=True):
-        with torch.no_grad():
-            # set the setps tensors
-            B, C, H, W = img.shape
-            blurred = torch.zeros((B, C, H, W)).to(self.device)
-            grad_x = torch.zeros((B, 1, H, W)).to(self.device)
-            grad_y = torch.zeros((B, 1, H, W)).to(self.device)
-            grad_magnitude = torch.zeros((B, 1, H, W)).to(self.device)
-            grad_orientation = torch.zeros((B, 1, H, W)).to(self.device)
-
-            # gaussian
-
-            for c in range(C):
-                blurred[:, c:c+1] = self.gaussian_filter(img[:, c:c+1])
-
-                grad_x = grad_x + self.sobel_filter_x(blurred[:, c:c+1])
-                grad_y = grad_y + self.sobel_filter_y(blurred[:, c:c+1])
-
-            # thick edges
-
-            grad_x, grad_y = grad_x / C, grad_y / C
-            grad_magnitude = (grad_x ** 2 + grad_y ** 2) ** 0.5
-            grad_orientation = torch.atan(grad_y / grad_x)
-            grad_orientation = grad_orientation * (360 / np.pi) + 180 # convert to degree
-            grad_orientation = torch.round(grad_orientation / 45) * 45  # keep a split by 45
-
-            # thin edges
-
-            directional = self.directional_filter(grad_magnitude)
-            # get indices of positive and negative directions
-            positive_idx = (grad_orientation / 45) % 8
-            negative_idx = ((grad_orientation / 45) + 4) % 8
-            thin_edges = grad_magnitude.clone()
-            # non maximum suppression direction by direction
-            for pos_i in range(4):
-                neg_i = pos_i + 4
-                # get the oriented grad for the angle
-                is_oriented_i = (positive_idx == pos_i) * 1
-                is_oriented_i = is_oriented_i + (positive_idx == neg_i) * 1
-                pos_directional = directional[:, pos_i]
-                neg_directional = directional[:, neg_i]
-                selected_direction = torch.stack([pos_directional, neg_directional])
-
-                # get the local maximum pixels for the angle
-                is_max = selected_direction.min(dim=0)[0] > 0.0
-                is_max = torch.unsqueeze(is_max, dim=1)
-
-                # apply non maximum suppression
-                to_remove = (is_max == 0) * 1 * (is_oriented_i) > 0
-                thin_edges[to_remove] = 0.0
-
-            # thresholds
-
-            if low_threshold is not None:
-                low = thin_edges > low_threshold
-
-                if high_threshold is not None:
-                    high = thin_edges > high_threshold
-                    # get black/gray/white only
-                    thin_edges = low * 0.5 + high * 0.5
-
-                    if hysteresis:
-                        # get weaks and check if they are high or not
-                        weak = (thin_edges == 0.5) * 1
-                        weak_is_high = (self.hysteresis(thin_edges) > 1) * weak
-                        thin_edges = high * 1 + weak_is_high * 1
-                else:
-                    thin_edges = low * 1
-
-
-        return blurred, grad_x, grad_y, grad_magnitude, grad_orientation, thin_edges
+        return thresholded

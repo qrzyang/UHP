@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import numpy as np
 import time
 from tensorboardX import SummaryWriter
-from datasets import __datasets__
+from datasets import __datasets__, MyCollator
 from models.HITNet import HITNet
 from utils import *
 from torch.utils.data import DataLoader
@@ -41,14 +41,14 @@ class Trainer:
 
             parser.add_argument('--dataset', default="kitti",
                                 help='dataset name', choices=__datasets__.keys())
-            parser.add_argument('--datapath', help='data path', default="/home/hey/SIA/cv/dataset/kitti")
+            parser.add_argument('--datapath', help='data path', default="/data/dataset/kitti")
 
             parser.add_argument('--trainlist',
                                 help='training list', default="filenames/kt2015_train_first20.txt")
             parser.add_argument('--testlist',
                                 help='testing list', default="filenames/kt2015_val_first20.txt")
 
-            parser.add_argument('--lr', type=float, default=0.0001,
+            parser.add_argument('--lr', type=float, default=1e-4,
                                 help='base learning rate')
             parser.add_argument('--batch_size', type=int, default=4,
                                 help='training batch size')
@@ -72,7 +72,7 @@ class Trainer:
             parser.add_argument('--seed', type=int, default=1,
                                 metavar='S', help='random seed (default: 1)')
 
-            parser.add_argument('--summary_freq', type=int, default=100,
+            parser.add_argument('--summary_freq', type=int, default=501,
                                 help='the frequency of saving summary')
             parser.add_argument('--save_freq', type=int, default=500,
                                 help='the frequency of saving checkpoint')
@@ -107,8 +107,10 @@ class Trainer:
         self.TestDataset = __datasets__["kitti"]
         self.train_dataset = self.TrainDataset(args.datapath, args.trainlist, True)
         self.test_dataset = self.TestDataset(args.datapath, args.testlist, False)
+        collate_fn = MyCollator()
         self.TrainImgLoader = DataLoader(self.train_dataset, args.batch_size, shuffle=True, 
-                                         num_workers=6, drop_last=False, pin_memory=True, 
+                                         num_workers=6, drop_last=True, pin_memory=True, 
+                                         collate_fn=collate_fn
                                         #  prefetch_factor=4
                                          )
         self.TestImgLoader = DataLoader(self.test_dataset, args.test_batch_size, shuffle=False, 
@@ -119,7 +121,7 @@ class Trainer:
         self.model = nn.DataParallel(self.model)
         self.model.to(args.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=args.lr, betas=(0.9, 0.999))
-        self.scheduler = CosineAnnealingLR(optimizer=self.optimizer, T_max=2000, eta_min=1e-6)
+        self.scheduler = CosineAnnealingLR(optimizer=self.optimizer, T_max=2000, eta_min=5e-6)
         # lr_history = scheduler_lr(optimizer, scheduler)
         # self.enable_amp = True if args.device == 'cuda' else False
         self.enable_amp = False
@@ -153,8 +155,6 @@ class Trainer:
             
             # training
             for batch_idx, sample in enumerate(self.TrainImgLoader):
-                # if batch_idx == 2:
-                #     break
                 global_step = len(self.TrainImgLoader) * epoch_idx + batch_idx
                 self.global_step = global_step
                 start_time = time.time()
@@ -163,6 +163,9 @@ class Trainer:
                 if do_summary:
                     save_scalars(self.logger, 'train', scalar_outputs, global_step)
                     save_images(self.logger, 'train', image_outputs, global_step)
+                    save_hist(self.logger, 'train', {'Pl_loss': image_outputs['Pl_loss'],
+                                                     'disp':image_outputs["disp_est"][-1],
+                                                     "grad_map": image_outputs["grad_map"]}, global_step)
                 del scalar_outputs, image_outputs
                 print('Epoch {}/{}, Iter {}/{}, train loss = {}, time = {:.3f}'.format(epoch_idx, args.epochs,
                                                                                         batch_idx,
@@ -179,16 +182,18 @@ class Trainer:
             if (epoch_idx + 1) % args.save_freq == 0 and epoch_idx >= args.ckpt_start_epoch:
                 checkpoint_data = {'epoch': epoch_idx, 'self.model': self.model.state_dict(), 'self.optimizer': self.optimizer.state_dict()}
                 torch.save(checkpoint_data, "{}/checkpoint_{:0>6}.ckpt".format(self.saver.experiment_dir, epoch_idx))
+
+            if (epoch_idx + 1) % 10 == 0:
+                checkpoint_data = {'epoch': epoch_idx, 'self.model': self.model.state_dict(), 'self.optimizer': self.optimizer.state_dict()}
+                torch.save(checkpoint_data, f"{self.saver.experiment_dir}/latest_checkpoint.ckpt")
             gc.collect()
 
             # testing
             avg_test_scalars = AverageMeterDict()
             for batch_idx, sample in enumerate(self.TestImgLoader):
-                # if batch_idx == 2:
-                #     break
                 global_step = len(self.TestImgLoader) * epoch_idx + batch_idx
                 start_time = time.time()
-                do_summary = global_step % 40 == 0
+                do_summary = global_step % 101 == 0
                 scalar_outputs, image_outputs = self.test_sample(sample, compute_metrics=do_summary)
                 if do_summary:
                     save_scalars(self.logger, 'test', scalar_outputs, global_step)
@@ -255,13 +260,8 @@ class Trainer:
 
         with amp.autocast(enabled=self.enable_amp):
             outputs = self.model(imgL, imgR)
-            # init_disp_pyramid = outputs["init_disp_pyramid"]
             prop_disp_pyramid = outputs["prop_disp_pyramid"]
-            # dx_pyramid = outputs["dx_pyramid"]
-            # dy_pyramid = outputs["dy_pyramid"]
-            # w_pyramid = outputs["w_pyramid"]
-            # loss = global_loss(init_cv_pyramid, prop_disp_pyramid, dx_pyramid, dy_pyramid, w_pyramid,
-            #                 disp_gt, dx_gt, dy_gt, args.maxdisp)
+
             outputs_h = {}
             max_i = 0
 
@@ -272,29 +272,39 @@ class Trainer:
             outputs_h["w_pyramid"] = outputs["w_pyramid"]
             outputs_h["conf"] = outputs["conf"]
 
-            if self.global_step < 2000:
-                args.loss_weights = [1, 1, 10, 0.1]     # w_loss, conf_loss, reprojection_loss, 3D_Pl_loss
-            elif self.global_step < 20000:
-                args.loss_weights = [1, 1, 10, 0.1]
+            gs = self.global_step
+
+            if gs < 10000:
+                args.loss_weights = [1, 1, 10, 0.01, 0]     # w_loss, conf_loss, reprojection_loss, 3D_Pl_loss
+            elif gs < 60000:
+                args.loss_weights = [1, 1, 10, (gs*1e-4-1)*0.1+0.01, 1]
             else:
-                args.loss_weights = [1, 1, 10, self.global_step*1e-4-1.9]
+                args.loss_weights = [1, 1, 10, (gs*1e-4-3)*0.05+0.01, 1]
+                
 
             
             loss_fun = total_loss.Loss(args)
             outputs_h, losses = loss_fun(sample, outputs_h)
             loss = losses["loss"]
             
-        scalar_outputs = {"weighted_loss_sum": loss}
-        img_warped = loss_fun.warp(imgR, prop_disp_pyramid[11])
-        img_conf = imgL.clone().permute(0, 2, 3, 1)
-        img_conf[outputs["conf"].squeeze(1)>0.5, :] = torch.tensor([193.0/256, 44.0/256, 31.0/256], device = args.device)
-        img_conf = img_conf.permute(0, 3, 1, 2)
-        img_conf_1 = (outputs["conf"].squeeze(1)>0.5).to(torch.float)
-        image_outputs = {"disp_est": prop_disp_pyramid, "disp_gt": disp_gt, "imgL": imgL, "imgR": imgR,
-                        "img_warped": img_warped, "img_conf": img_conf, "img_conf_1": img_conf_1,
-                        "img_canny" : outputs_h["img_canny"]
-                        }
-        # pdb.set_trace()
+        with torch.no_grad():
+            grad_map = outputs_h["grad2_map"]
+            Pl_loss = outputs_h["Pl_loss"]
+            if "occ" in outputs_h.keys():
+                occ = outputs_h["occ"]
+            else:
+                occ = None
+            # grad_map[grad_map>2.*grad_map.mean()] = 0.
+            scalar_outputs = {"weighted_loss_sum": loss}
+            img_warped = outputs_h["warped"]
+            
+            image_outputs = {"disp_est": prop_disp_pyramid,  "imgL": imgL, "imgR": imgR,
+                            "img_warped": img_warped, 
+                            "img_canny" : outputs_h["img_canny"], "img_ssim" :outputs_h["ssim_loss"],  "img_l1" :outputs_h["l1_loss"],
+                            "Pl_loss": Pl_loss, "grad_map":grad_map, "occ": occ,
+                            "depth": outputs_h["depth"], "disp_gt": disp_gt,
+                            }
+            # pdb.set_trace()
 
         if compute_metrics:
             with torch.no_grad():
@@ -313,10 +323,6 @@ class Trainer:
         loss.backward()
         self.optimizer.step()
         self.scheduler.step()
-        # self.scaler.scale(loss).backward()
-        # self.scaler.step(self.optimizer)
-        # # self.scaler.step(self.scheduler)
-        # self.scaler.update()
         
 
         return tensor2float(loss), tensor2float(scalar_outputs), image_outputs

@@ -101,9 +101,9 @@ def save_hist(logger, mode_tag, in_tensor, global_step):
     for tag, values in images_dict.items():
         if not isinstance(values, list) and not isinstance(values, tuple):
             values = [values]
-            print('values len: {}'.format(len(values)))
+            # print('values len: {}'.format(len(values)))
         for idx, value in enumerate(values):
-            print('value shape: {}'.format(value.shape))
+            # print('value shape: {}'.format(value.shape))
             if len(value.shape) == 3:
                 value = value[:, np.newaxis, :, :]
             value = value[:1]

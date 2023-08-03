@@ -4,7 +4,9 @@ The code for "Unsupervised Hierarchical Iterative Tile Refinement Network with 3
 
 ## Citation
 
-
+## Results
+![result1](assets/result1.png)
+![result2](assets/result2.png)
 ## Settings
 
 The code is tested with Pytorch 1.13, CUDA 11, Python 3.10 and Ubuntu 22.04 using a single GPU. The requirements.txt is provided.
@@ -16,6 +18,7 @@ pip install -r requirements
 ## Train
 
 A train.sh file is provided for KITTI dataset. The `DATAPATH` in train.sh needs to be replaced to your path of KITTI dataset.
+
 ```sh
 DATAPATH=YOUR_DATAPATH
 LOGDIR=./logs
@@ -36,6 +39,7 @@ The corresponding edge images to KITTI images are needed. They could be generate
 Pre-trained model for KITTI 2015 is available at [Google Drive](https://drive.google.com/file/d/1A5naJwn9h31ogr9Oq_V1QxkF3u2cIoKu/view?usp=share_link).
 
 A test.sh file is provided for KITTI dataset. The `DATAPATH` needs to be replaced to your path of KITTI dataset and the `MODEL` needs to be set as the path of trained model.
+
 ```sh
 DATAPATH=YOUR_DATAPATH
 LOGDIR=./logs/test
