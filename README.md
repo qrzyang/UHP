@@ -3,7 +3,16 @@
 The code for "Unsupervised Hierarchical Iterative Tile Refinement Network with 3D Planar Segmentation Loss"
 
 ## Citation
-
+@article{yang2024unsupervised,
+  title={Unsupervised Hierarchical Iterative Tile 
+Refinement Network with 3D Planar Segmentation 
+Loss},
+  author={Yang, Ruizhi and Li, Xingqiang and Cong, 
+Rigang and Du, Jinsong},
+  journal={IEEE Robotics and Automation Letters},
+  year={2024},
+  publisher={IEEE}
+}
 ## Results
 ![result1](assets/result1.png)
 ![result2](assets/result2.png)
